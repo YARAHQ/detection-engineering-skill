@@ -154,8 +154,30 @@ generate_rule() {
     # Check if yarGen server is running
     if ! curl -s http://127.0.0.1:8080/api/health >/dev/null 2>&1; then
         log_warn "yarGen server not running, attempting to start..."
-        log_info "Please start manually: cd ~/clawd/projects/yarGen-Go/repo && ./yargen serve"
-        return 1
+        local yargen_dir="${HOME}/clawd/projects/yarGen-Go/repo"
+        if [ -f "$yargen_dir/yargen" ]; then
+            # Start server from the correct directory so it finds the databases
+            (cd "$yargen_dir" && nohup ./yargen serve > /tmp/yargen-auto.log 2>&1 &)
+            log_info "Starting yarGen server..."
+            # Wait for server to be ready
+            local attempts=0
+            while [ $attempts -lt 90 ]; do
+                if curl -s http://127.0.0.1:8080/api/health >/dev/null 2>&1; then
+                    log_success "yarGen server is ready!"
+                    break
+                fi
+                sleep 2
+                attempts=$((attempts + 1))
+            done
+            if [ $attempts -eq 90 ]; then
+                log_error "yarGen server failed to start within 3 minutes"
+                log_info "Start manually: cd ~/clawd/projects/yarGen-Go/repo && ./yargen serve"
+                return 1
+            fi
+        else
+            log_error "yarGen binary not found at $yargen_dir/yargen"
+            return 1
+        fi
     fi
     
     # Submit sample using yargen-util
@@ -374,11 +396,28 @@ review_rule() {
         echo ""
         echo ">>> RULE GENERATION COMPLETE <<<"
         echo ""
-        echo "Use this rule:"
+        
+        # Display the final rule
+        echo ""
+        echo "════════════════════════════════════════════════════════════════════"
+        echo "                    FINAL YARA RULE"
+        echo "════════════════════════════════════════════════════════════════════"
+        echo ""
+        if [ -n "$OUTPUT" ] && [ -f "$OUTPUT" ]; then
+            cat "$OUTPUT"
+        elif [ -f "$improved_rule" ]; then
+            cat "$improved_rule"
+        elif [ -f "$rule_file" ]; then
+            cat "$rule_file"
+        fi
+        echo ""
+        echo "════════════════════════════════════════════════════════════════════"
+        echo ""
+        echo "Rule also saved to:"
         if [ -n "$OUTPUT" ]; then
-            echo "  cat $OUTPUT"
+            echo "  $OUTPUT"
         else
-            echo "  cat $improved_rule"
+            echo "  $improved_rule"
         fi
     fi
 }
@@ -423,13 +462,13 @@ generate_improved_rule() {
     fi
     
     # Generate improved rule name
-    local improved_name="${rule_prefix}_Hacktool_Pentest_Backdoor"
+    local improved_name="${rule_prefix}_Unknown_Sample"
     if [ -n "$date" ]; then
         local date_short=$(echo "$date" | sed 's/20\([0-9]\{2\}\)-\([0-9]\{2\}\)-[0-9]\{2\}/\1\2/')
-        improved_name="${rule_prefix}_Hacktool_Pentest_Backdoor_${date_short}"
+        improved_name="${rule_prefix}_Unknown_Sample_${date_short}"
     fi
     
-    # Output improved rule
+    # Output improved rule header
     cat << EOF
 /*
    YARA Rule Set
@@ -443,7 +482,7 @@ generate_improved_rule() {
 
 rule ${improved_name} {
    meta:
-      description = "${description:-Suspicious executable with hacktool characteristics}"
+      description = "${description:-Suspicious executable - requires analysis}"
       author = "${author:-yarGen}"
       date = "${date:-$(date +%Y-%m-%d)}"
       hash1 = "${hash}"
@@ -458,29 +497,201 @@ EOF
         echo "      vt_tags = \"${vt_tags}\""
     fi
     
-    cat << EOF
-   strings:
-      \$x1 = "[ERROR] Usage: stager_evade.exe <download_url>" fullword ascii
-      
-      \$s1 = "[DEBUG] Parsed URL - Hostname: %s, Port: %d, Path: %s" fullword ascii
-      \$s2 = "stager_debug.log" fullword ascii
-      \$s3 = "[DEBUG] Download complete! Total size: %zu bytes" fullword ascii
-      \$s4 = "[ERROR] PE execution failed with code: %d" fullword ascii
-      \$s5 = "[DEBUG] PE execution completed" fullword ascii
-      \$s6 = "[DEBUG] Waiting %d seconds before execution..." fullword ascii
-      \$s7 = "[ERROR] Download failed or file is empty" fullword ascii
-      \$s8 = "[DEBUG] Starting PE execution, size: %zu bytes" fullword ascii
-      
-      \$op1 = { c3 0f 1f 40 00 66 66 2e 0f 1f 84 }
-
-   condition:
-      uint16(0) == 0x5a4d and
-      ${sample_size:+filesize < $(( (sample_size * 3) / 2 ))KB and}
-      \$x1 and
-      4 of (\$s*) and
-      any of (\$op*)
-}
-EOF
+    # Extract strings from original rule
+    echo "   strings:"
+    
+    # Parse strings and collect them with their goodware counts for scoring
+    # Format: "goodware_count|string_content"
+    declare -a scored_strings
+    local has_opcodes=false
+    local opcode_line=""
+    
+    # Patterns for low-quality strings to exclude
+    # - Build artifacts: GCC, MSVC, stack frame patterns
+    # - Random code: short garbage strings, non-word characters
+    # - Compiler noise
+    local skip_pattern='(GCC:|Built by MSYS|clang version|Microsoft Visual|stack frame|\[\^_\]|\^[A-Z]\|\\[A-Z]\^)'
+    
+    while IFS= read -r line; do
+        # Check for opcode patterns - keep max 1-2
+        if echo "$line" | grep -qE '^\s*\$op[0-9]+\s*='; then
+            has_opcodes=true
+            # Only keep first opcode (most significant)
+            if [ -z "$opcode_line" ]; then
+                opcode_line="$line"
+            fi
+            continue
+        fi
+        
+        # Check if this is a string definition line ($x, $s, etc.)
+        if echo "$line" | grep -qE '^\s*\$[xsafp][0-9]+\s*='; then
+            # Extract the string value for analysis
+            local str_value
+            str_value=$(echo "$line" | grep -oP '=\s*"\K[^"]+' | head -1)
+            
+            # Skip build artifacts and garbage strings
+            if [ -z "$str_value" ] || [ "$str_value" = " " ]; then
+                continue  # Empty string
+            fi
+            # Compiler/build strings
+            case "$str_value" in
+                *"GCC:"*|*"Built by MSYS"*|*"Microsoft"*|*"Visual Studio"*|*"clang version"*)
+                    continue
+                    ;;
+            esac
+            # Stack frame artifacts: strings with mostly ^ [ ] \ _ and capital letters
+            # These are machine code that happens to be in ASCII range
+            local special_chars alpha_chars
+            special_chars=$(echo "$str_value" | tr -cd '[]^_\\' | wc -c)
+            alpha_chars=$(echo "$str_value" | tr -cd '[:alpha:]' | wc -c)
+            if [ "$special_chars" -ge 3 ] && [ "$special_chars" -ge "$alpha_chars" ]; then
+                continue  # Too many brackets/special chars relative to letters
+            fi
+            # Random-looking short strings (likely machine code in ASCII range)
+            # Meaningful strings have: words, format specifiers, paths, identifiers
+            local str_len=${#str_value}
+            if [ "$str_len" -ge 6 ] && [ "$str_len" -le 20 ]; then
+                # Skip if string looks like garbage (no structure)
+                # Meaningful patterns: spaces (words), underscores (identifiers), 
+                # format specs (%s, %d), paths (\, /), extensions (.exe)
+                if ! echo "$str_value" | grep -qE '[ _]|%[sdxpufcl]|\\\\|/|\.[a-zA-Z]{2,4}$|^[A-Z][a-z]+'; then
+                    # No meaningful structure - check character distribution
+                    # Garbage often has: mixed case without pattern, digits mixed with letters, punctuation
+                    local lower upper digit
+                    lower=$(echo "$str_value" | tr -cd '[:lower:]' | wc -c)
+                    upper=$(echo "$str_value" | tr -cd '[:upper:]' | wc -c)
+                    digit=$(echo "$str_value" | tr -cd '[:digit:]' | wc -c)
+                    # Random code often has roughly equal mix of cases
+                    # Or starts with digit/has digits scattered throughout
+                    if [ "$digit" -ge 1 ] && [ "$upper" -ge 2 ] && [ "$lower" -ge 2 ]; then
+                        continue  # Looks like random mixed code: "8MZuEHcP<H"
+                    fi
+                fi
+            fi
+            
+            # Extract goodware count (default to 0 if not found)
+            local gw_count=0
+            if echo "$line" | grep -qE '/\* goodware:\s*[0-9]+\s*\*/'; then
+                gw_count=$(echo "$line" | grep -oP '/\* goodware:\s*\K[0-9]+' | head -1)
+            fi
+            # Store as "goodware_count|full_line" for sorting
+            scored_strings+=("${gw_count}|${line}")
+        fi
+    done < <(sed -n '/strings:/,/condition:/p' "$input_file" | tail -n +2 | head -n -1)
+    
+    # Sort by goodware count (lowest first = highest scoring)
+    # Use process substitution with sort
+    local sorted_strings
+    sorted_strings=$(printf '%s\n' "${scored_strings[@]}" | sort -t'|' -k1 -n)
+    
+    # Limit to maximum 10 strings total (optimal 3-7)
+    # Keep 1 opcode (if present) + up to 9 strings, but aim for 3-7 total
+    local max_strings=7  # Aim for optimal range
+    if [ ${#scored_strings[@]} -gt 10 ]; then
+        max_strings=9  # Allow up to 9 if we have many, plus 1 opcode = 10 total
+    fi
+    
+    local string_count=0
+    local x_count=0 s_count=0
+    
+    # Output sorted strings (best ones first)
+    while IFS='|' read -r gw_count line; do
+        [ -z "$line" ] && continue
+        
+        string_count=$((string_count + 1))
+        if [ $string_count -gt $max_strings ]; then
+            break
+        fi
+        
+        # Extract just the value part and the string value
+        local value_part str_value
+        value_part=$(echo "$line" | sed -E 's/^\s*\$[xsafp][0-9]+\s*=\s*/= /')
+        str_value=$(echo "$line" | grep -oP '=\s*"\K[^"]+' | head -1)
+        
+        # Categorize: Highly specific strings get $x*, most others get $s*
+        # $x* criteria: unique filename, specific identifier (not generic), unique string
+        # $s* criteria: generic service names, format strings, common text
+        local is_highly_specific=false
+        
+        # Check if highly specific (unique identifier or filename)
+        if echo "$str_value" | grep -qE '\.exe$|\.dll$|\.bin$'; then
+            # Executable filenames are somewhat specific
+            if ! echo "$str_value" | grep -qiE 'svchost\.exe|explorer\.exe|cmd\.exe|powershell\.exe'; then
+                is_highly_specific=true
+            fi
+        elif echo "$str_value" | grep -qE '^[a-z]+_[a-z]+$'; then
+            # Identifier with underscore like "svchost_upd" - somewhat specific
+            is_highly_specific=true
+        fi
+        
+        # Most strings should be $s* (grouped, need multiple)
+        if [ "$is_highly_specific" = true ]; then
+            x_count=$((x_count + 1))
+            echo "      \$x${x_count} ${value_part}"
+        else
+            s_count=$((s_count + 1))
+            echo "      \$s${s_count} ${value_part}"
+        fi
+    done <<< "$sorted_strings"
+    
+    # Output opcode if we have one
+    if [ -n "$opcode_line" ]; then
+        echo "      ${opcode_line#* }"  # Remove leading whitespace
+    fi
+    
+    # Extract condition
+    echo ""
+    echo "   condition:"
+    
+    # Get condition lines (between condition: and closing brace)
+    local condition_content
+    condition_content=$(sed -n '/condition:/,/^[[:space:]]*}/p' "$input_file" | tail -n +2 | head -n -1)
+    
+    # Fix condition based on string types present
+    if [ "$has_opcodes" = false ]; then
+        # Remove opcode conditions if no opcodes present
+        condition_content=$(echo "$condition_content" | sed -E 's/and[[:space:]]+(any|all) of \(\$op\*\)//g')
+    else
+        # Fix 'all of ($op*)' to 'any of ($op*)' when only one opcode
+        condition_content=$(echo "$condition_content" | sed 's/all of (\$op\*)/any of ($op*)/g')
+    fi
+    
+    # Fix filesize condition if it's clearly wrong (less than 100KB is often a yarGen bug)
+    # Remove overly restrictive filesize conditions - let analyst decide
+    if echo "$condition_content" | grep -qE 'filesize\s*<\s*[0-9]+KB'; then
+        local fs_value
+        fs_value=$(echo "$condition_content" | grep -oP 'filesize\s*<\s*\K[0-9]+' | head -1)
+        if [ -n "$fs_value" ] && [ "$fs_value" -lt 100 ]; then
+            # Replace with more reasonable default (500KB for PE files)
+            condition_content=$(echo "$condition_content" | sed -E 's/filesize\s*<\s*[0-9]+KB/filesize < 500KB/g')
+        fi
+    fi
+    
+    # Update condition based on string types
+    # Most strings are now $s* (grouped), few are $x* (highly specific)
+    # Require multiple $s* matches for detection
+    
+    if [ "$s_count" -gt 0 ]; then
+        # Replace original condition with grouped string logic
+        # Use 3 of ($s*) as default, or fewer if we don't have enough
+        local s_threshold=3
+        if [ "$s_count" -lt 3 ]; then
+            s_threshold=$s_count
+        fi
+        
+        if [ "$x_count" -gt 0 ]; then
+            # We have both $x and $s strings: 1 of ($x*) or 3 of ($s*)
+            condition_content=$(echo "$condition_content" | sed "s/1 of (\\\$x\*)/1 of (\$x*) or ${s_threshold} of (\$s*)/g")
+        else
+            # Only $s strings: just require 3 of ($s*)
+            condition_content=$(echo "$condition_content" | sed "s/1 of (\\\$x\*)/${s_threshold} of (\$s*)/g")
+        fi
+    fi
+    
+    # Output condition with proper indentation
+    echo "$condition_content" | sed 's/^/      /'
+    
+    echo "}"
 }
 
 # Full pipeline: hash -> rule
@@ -510,13 +721,20 @@ cmd_generate_from_hash() {
     fi
     
     # Step 3: Review rule
+    local improved_rule="${rule_path%.yar}_improved.yar"
     if [ -f "$rule_path" ]; then
         review_rule "$rule_path"
     fi
     
-    # Output result
+    # Output result - use improved version if available, otherwise original
     if [ -n "$OUTPUT" ]; then
-        if [ -f "$rule_path" ]; then
+        if [ -f "$improved_rule" ]; then
+            cp "$improved_rule" "$OUTPUT"
+            # Also save original for comparison
+            cp "$rule_path" "${OUTPUT%.yar}_original.yar"
+            log_success "Rule saved to: $OUTPUT"
+            log_info "Original yarGen output saved to: ${OUTPUT%.yar}_original.yar"
+        elif [ -f "$rule_path" ]; then
             cp "$rule_path" "$OUTPUT"
             log_success "Rule saved to: $OUTPUT"
         fi
